@@ -20,6 +20,12 @@ from typing import Any, Iterable
 
 STATUS_ORDER = {"PASS": 0, "INFO": 1, "WARN": 2, "FAIL": 3, "ERROR": 4}
 SEVERITY_ORDER = {"low": 1, "medium": 2, "high": 3}
+BLOCK_PUBLIC_ACCESS_KEYS = (
+    "BlockPublicAcls",
+    "IgnorePublicAcls",
+    "BlockPublicPolicy",
+    "RestrictPublicBuckets",
+)
 
 
 class AWSCLIError(RuntimeError):
@@ -155,13 +161,21 @@ def check_iam_root(runner: AWSRunner) -> list[Finding]:
 
 
 def _all_block_public_access(block: dict[str, Any]) -> bool:
-    keys = (
-        "BlockPublicAcls",
-        "IgnorePublicAcls",
-        "BlockPublicPolicy",
-        "RestrictPublicBuckets",
-    )
-    return all(block.get(key) is True for key in keys)
+    return all(block.get(key) is True for key in BLOCK_PUBLIC_ACCESS_KEYS)
+
+
+def _effective_block_public_access(
+    account_block: dict[str, Any], bucket_block: dict[str, Any]
+) -> dict[str, bool]:
+    """Combine account/organization and bucket controls using S3's most-restrictive rule."""
+    return {
+        key: account_block.get(key) is True or bucket_block.get(key) is True
+        for key in BLOCK_PUBLIC_ACCESS_KEYS
+    }
+
+
+def _missing_public_access_block(exc: AWSCLIError) -> bool:
+    return "nosuchpublicaccessblockconfiguration" in exc.stderr.lower()
 
 
 def check_s3(runner: AWSRunner) -> list[Finding]:
@@ -178,7 +192,8 @@ def check_s3(runner: AWSRunner) -> list[Finding]:
             )
         ]
 
-    if not buckets:
+    bucket_names = [str(bucket.get("Name", "")) for bucket in buckets if bucket.get("Name")]
+    if not bucket_names:
         return [
             finding(
                 "s3.public_access",
@@ -189,57 +204,143 @@ def check_s3(runner: AWSRunner) -> list[Finding]:
             )
         ]
 
-    public_block_ok = 0
-    versioning_enabled = 0
-    errors = 0
+    # S3 evaluates the most restrictive combination of the bucket configuration and the
+    # effective account-level configuration. The latter may include Organizations policy.
+    account_block: dict[str, Any] | None = None
+    account_lookup_error = False
+    try:
+        account_id = str(runner.run("sts", "get-caller-identity").get("Account", ""))
+        if len(account_id) == 12 and account_id.isdigit():
+            try:
+                account_block = runner.run(
+                    "s3control", "get-public-access-block", "--account-id", account_id
+                ).get("PublicAccessBlockConfiguration", {})
+            except AWSCLIError as exc:
+                if _missing_public_access_block(exc):
+                    account_block = {}
+                else:
+                    account_lookup_error = True
+        else:
+            account_lookup_error = True
+    except AWSCLIError:
+        account_lookup_error = True
 
-    for bucket in buckets:
-        name = str(bucket.get("Name", ""))
-        if not name:
-            continue
-        try:
-            block = runner.run("s3api", "get-public-access-block", "--bucket", name).get(
-                "PublicAccessBlockConfiguration", {}
-            )
-            if _all_block_public_access(block):
-                public_block_ok += 1
-        except AWSCLIError:
-            # Missing configuration and insufficient permissions are both treated conservatively.
-            errors += 1
+    public_block_ok = 0
+    public_block_unprotected = 0
+    public_block_unknown = 0
+    public_access_errors = 0
+    versioning_enabled = 0
+    versioning_disabled = 0
+    versioning_errors = 0
+
+    account_blocks_all = account_block is not None and _all_block_public_access(account_block)
+
+    for name in bucket_names:
+        if account_blocks_all:
+            # Account/organization controls alone are sufficient, so bucket-level settings
+            # cannot make the effective configuration less restrictive.
+            public_block_ok += 1
+        else:
+            bucket_block: dict[str, Any] | None = None
+            try:
+                bucket_block = runner.run("s3api", "get-public-access-block", "--bucket", name).get(
+                    "PublicAccessBlockConfiguration", {}
+                )
+            except AWSCLIError as exc:
+                if _missing_public_access_block(exc):
+                    bucket_block = {}
+                else:
+                    public_access_errors += 1
+
+            if bucket_block is None:
+                public_block_unknown += 1
+            elif account_block is None:
+                # Even when account settings cannot be read, a fully protected bucket is
+                # known-safe because account settings can only make protection stricter.
+                if _all_block_public_access(bucket_block):
+                    public_block_ok += 1
+                else:
+                    public_block_unknown += 1
+            else:
+                effective = _effective_block_public_access(account_block, bucket_block)
+                if _all_block_public_access(effective):
+                    public_block_ok += 1
+                else:
+                    public_block_unprotected += 1
 
         try:
             versioning = runner.run("s3api", "get-bucket-versioning", "--bucket", name)
             if versioning.get("Status") == "Enabled":
                 versioning_enabled += 1
+            else:
+                versioning_disabled += 1
         except AWSCLIError:
-            errors += 1
+            versioning_errors += 1
 
-    total = len(buckets)
-    block_status = "PASS" if public_block_ok == total else "FAIL"
-    findings = [
+    total = len(bucket_names)
+    if public_block_ok == total:
+        block_status = "PASS"
+    elif public_block_unprotected > 0:
+        block_status = "FAIL"
+    else:
+        block_status = "ERROR"
+
+    block_summary = (
+        f"{public_block_ok}/{total} buckets have all four effective Block Public Access controls enabled "
+        "after combining account/organization and bucket settings."
+    )
+    if public_block_unprotected:
+        block_summary += f" {public_block_unprotected} bucket(s) are missing at least one effective control."
+    if public_block_unknown:
+        block_summary += f" {public_block_unknown} bucket(s) could not be fully evaluated."
+    if public_access_errors:
+        block_summary += f" {public_access_errors} bucket-level Block Public Access check(s) returned errors."
+    if account_lookup_error and public_block_unknown:
+        block_summary += " Account-level Block Public Access could not be read."
+
+    if versioning_enabled == total:
+        versioning_status = "PASS"
+    elif versioning_disabled > 0:
+        versioning_status = "WARN"
+    else:
+        versioning_status = "ERROR"
+
+    versioning_summary = f"{versioning_enabled}/{total} buckets have versioning enabled."
+    if versioning_disabled:
+        versioning_summary += f" {versioning_disabled} bucket(s) are disabled or suspended."
+    if versioning_errors:
+        versioning_summary += f" {versioning_errors} versioning check(s) returned errors."
+
+    return [
         finding(
             "s3.public_access",
             "S3 Block Public Access",
             block_status,
             "high",
-            f"{public_block_ok}/{total} buckets have all four bucket-level Block Public Access controls enabled."
-            + (f" {errors} bucket checks returned errors." if errors else ""),
+            block_summary,
             None
             if block_status == "PASS"
-            else "Enable all four S3 Block Public Access controls unless a reviewed public bucket is intentionally required.",
+            else (
+                "Enable all four effective S3 Block Public Access controls at the account/organization or bucket level."
+                if block_status == "FAIL"
+                else "Grant read access to account- and bucket-level Block Public Access settings so effective protection can be evaluated."
+            ),
         ),
         finding(
             "s3.versioning",
             "S3 bucket versioning",
-            "PASS" if versioning_enabled == total else "WARN",
+            versioning_status,
             "medium",
-            f"{versioning_enabled}/{total} buckets have versioning enabled.",
+            versioning_summary,
             None
-            if versioning_enabled == total
-            else "Consider enabling versioning for buckets that store important or mutable data.",
+            if versioning_status == "PASS"
+            else (
+                "Consider enabling versioning for buckets that store important or mutable data."
+                if versioning_status == "WARN"
+                else "Grant read access to S3 bucket versioning settings so versioning can be evaluated."
+            ),
         ),
     ]
-    return findings
 
 
 def check_cloudtrail(runner: AWSRunner) -> list[Finding]:
