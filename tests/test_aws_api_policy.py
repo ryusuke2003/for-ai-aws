@@ -32,25 +32,35 @@ class RunnerCallVisitor(ast.NodeVisitor):
 
     def visit_Call(self, node: ast.Call) -> None:
         func = node.func
-        is_runner_run = (
-            isinstance(func, ast.Attribute)
-            and func.attr == "run"
-            and isinstance(func.value, ast.Name)
-            and func.value.id == "runner"
-        )
+        if not (isinstance(func, ast.Attribute) and func.attr == "run"):
+            self.generic_visit(node)
+            return
 
-        if is_runner_run:
-            if len(node.args) < 2:
-                self.invalid_calls.append((node.lineno, "service and operation must be explicit"))
+        # subprocess.run() is the implementation detail used inside AWSRunner itself.
+        if isinstance(func.value, ast.Name) and func.value.id == "subprocess":
+            self.generic_visit(node)
+            return
+
+        # All application-level AWS calls must use the conventional `runner.run(...)`
+        # shape. This prevents aliases such as `r.run(...)` from bypassing this audit.
+        if not (isinstance(func.value, ast.Name) and func.value.id == "runner"):
+            self.invalid_calls.append(
+                (node.lineno, "unexpected .run() receiver; AWS calls must use runner.run")
+            )
+            self.generic_visit(node)
+            return
+
+        if len(node.args) < 2:
+            self.invalid_calls.append((node.lineno, "service and operation must be explicit"))
+        else:
+            service = self._literal_string(node.args[0])
+            operation = self._literal_string(node.args[1])
+            if service is None or operation is None:
+                self.invalid_calls.append(
+                    (node.lineno, "service and operation must be string literals")
+                )
             else:
-                service = self._literal_string(node.args[0])
-                operation = self._literal_string(node.args[1])
-                if service is None or operation is None:
-                    self.invalid_calls.append(
-                        (node.lineno, "service and operation must be string literals")
-                    )
-                else:
-                    self.operations.append((service, operation, node.lineno))
+                self.operations.append((service, operation, node.lineno))
 
         self.generic_visit(node)
 
@@ -69,7 +79,7 @@ class AwsApiPolicyTests(unittest.TestCase):
 
         self.assertFalse(
             visitor.invalid_calls,
-            "AWSRunner calls must use literal service/operation names so CI can audit them: "
+            "AWSRunner calls must use the auditable runner.run(service, operation, ...) form: "
             f"{visitor.invalid_calls}",
         )
         self.assertTrue(visitor.operations, "Expected at least one AWSRunner call to audit")
@@ -86,8 +96,8 @@ class AwsApiPolicyTests(unittest.TestCase):
         )
 
     def test_allowlist_contains_only_read_style_operation_names(self):
-        # This is defense in depth, not the primary proof of safety. The explicit allowlist
-        # above remains the source of truth and should be reviewed whenever it changes.
+        # Defense in depth: operation names are also constrained to AWS read-style verbs.
+        # The explicit allowlist above remains the primary source of truth.
         allowed_prefixes = ("describe-", "get-", "list-")
         suspicious = sorted(
             f"{service} {operation}"
