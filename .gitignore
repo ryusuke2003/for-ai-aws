@@ -1,0 +1,25 @@
+# Local environment / credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Generated audit output (may contain AWS account metadata)
+reports/
+*.audit.json
+*.audit.md
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
