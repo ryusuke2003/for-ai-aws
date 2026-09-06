@@ -240,9 +240,9 @@ def check_s3(runner: AWSRunner) -> list[Finding]:
 
 def check_cloudtrail(runner: AWSRunner) -> list[Finding]:
     try:
-        trails = runner.run("cloudtrail", "describe-trails", "--include-shadow-trails", "false").get(
-            "trailList", []
-        )
+        # The AWS CLI default includes shadow trails. Keep them so organization trails
+        # remain visible from member accounts and multi-Region replicas are not missed.
+        trails = runner.run("cloudtrail", "describe-trails").get("trailList", [])
     except AWSCLIError as exc:
         return [
             finding(
@@ -261,7 +261,7 @@ def check_cloudtrail(runner: AWSRunner) -> list[Finding]:
                 "CloudTrail logging",
                 "FAIL",
                 "high",
-                "No non-shadow CloudTrail trail was found.",
+                "No CloudTrail trail was found.",
                 "Create an organization or account trail and enable continuous logging.",
             )
         ]
