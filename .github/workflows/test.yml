@@ -22,8 +22,11 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Secret scan
+        run: python scripts/check_no_secrets.py
+
       - name: Compile
-        run: python -m py_compile src/aws_security_snapshot.py
+        run: python -m py_compile src/aws_security_snapshot.py scripts/check_no_secrets.py
 
       - name: Unit tests
         run: python -m unittest discover -s tests -p 'test_*.py' -v
