@@ -23,10 +23,14 @@ SEVERITY_ORDER = {"low": 1, "medium": 2, "high": 3}
 
 
 class AWSCLIError(RuntimeError):
-    """Raised when an AWS CLI command fails."""
+    """Raised when an AWS CLI command fails without exposing raw AWS CLI stderr."""
 
     def __init__(self, command: list[str], stderr: str, returncode: int) -> None:
-        super().__init__(stderr.strip() or f"AWS CLI exited with {returncode}")
+        # AWS CLI errors may contain account IDs, ARNs, resource names, and principal names.
+        # Keep stderr only for internal classification; str(exc) must always be safe to emit.
+        super().__init__(
+            f"AWS CLI exited with {returncode}; error details were omitted to protect account and resource identifiers"
+        )
         self.command = command
         self.stderr = stderr.strip()
         self.returncode = returncode
