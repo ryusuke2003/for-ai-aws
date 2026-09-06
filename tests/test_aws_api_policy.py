@@ -20,6 +20,7 @@ ALLOWED_AWS_OPERATIONS = {
     ("s3api", "get-bucket-versioning"),
     ("s3api", "get-public-access-block"),
     ("s3api", "list-buckets"),
+    ("s3control", "get-public-access-block"),
     ("securityhub", "describe-hub"),
     ("sts", "get-caller-identity"),
 }
