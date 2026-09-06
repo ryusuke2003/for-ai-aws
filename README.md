@@ -8,7 +8,7 @@ AWS CLI の既存認証を使って、AWSアカウントの代表的なセキュ
 
 - RootユーザーのMFA
 - Rootユーザーのアクセスキー有無
-- S3 Block Public Access
+- S3 Block Public Access（アカウント/Organizationsとバケット設定を組み合わせた実効状態）
 - S3 Versioning
 - CloudTrailの記録状態
 - CloudTrailのマルチリージョン化
@@ -69,6 +69,7 @@ python3 src/aws_security_snapshot.py \
 - `sts:GetCallerIdentity`
 - `iam:GetAccountSummary`
 - `s3:ListAllMyBuckets`
+- `s3:GetAccountPublicAccessBlock`
 - `s3:GetBucketPublicAccessBlock`
 - `s3:GetBucketVersioning`
 - `cloudtrail:DescribeTrails`
@@ -80,6 +81,8 @@ python3 src/aws_security_snapshot.py \
 - `securityhub:DescribeHub`
 - `ec2:GetEbsEncryptionByDefault`
 - `ec2:DescribeRegions`（`--all-regions` 使用時）
+
+S3 Block Public Accessは、バケット単体の設定だけではなく、アカウントレベル（OrganizationsのS3 Block Public Accessポリシーを継承している場合を含む）との最も制限が厳しい組み合わせで評価します。アカウント設定を読み取れず、バケット設定だけでは安全性を確定できない場合は、誤ってFAIL/PASSにせず `ERROR` として扱います。
 
 既存のReadOnlyAccess相当でも実行できますが、本番環境では必要最小限の監査用ロールを作る方が安全です。
 
